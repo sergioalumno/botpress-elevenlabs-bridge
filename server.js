@@ -69,7 +69,7 @@ app.post('/incoming-call', (req, res) => {
     voice: ELEVENLABS_VOICE_ID,
     language: 'es-ES',
     transcriptionLanguage: 'es-ES',
-    welcomeGreeting: 'Hola, soy tu asistente de gestión de gastos. ¿En qué puedo ayudarte?',
+    welcomeGreeting: 'Hi, I’m the Sevilla Walking Tour assistant. How can I help you? Hola, soy el asistente de Sevilla Walking Tour. ¿En qué puedo ayudarte?',
     interruptible: 'true',
     // ElevenLabs text normalization mejora pronunciación de números, fechas, etc.
     elevenlabsTextNormalization: 'auto'
@@ -185,7 +185,8 @@ async function initBotpressSession(callSid, ws) {
       userKey,
       userId,
       conversationId,
-      sseAbort: abortController
+      sseAbort: abortController,
+      lastMessageWords: 0 // Track words for hangup calculation
     });
 
     console.log(`✅ [${callSid}] Sesión de Botpress lista`);
@@ -264,12 +265,50 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
 
               if (botText && ws.readyState === ws.OPEN) {
                 console.log(`🤖 [${callSid}] Bot responde: "${botText}"`);
-                ws.send(JSON.stringify({
-                  type: 'text',
-                  token: botText,
-                  last: true
-                }));
-                console.log(`📤 [${callSid}] Texto enviado a Twilio para TTS con ElevenLabs`);
+
+                // --- LÓGICA PARA COLGAR LA LLAMADA ---
+                const isHangup = botText.includes('[COLGAR]');
+                const cleanText = botText.replace(/\[COLGAR\]/g, '').trim();
+
+                const session = activeSessions.get(callSid);
+
+                // Enviar el texto limpio (sin la etiqueta) a Twilio/ElevenLabs
+                if (cleanText) {
+                  ws.send(JSON.stringify({
+                    type: 'text',
+                    token: cleanText,
+                    last: true
+                  }));
+                  console.log(`📤 [${callSid}] Texto enviado a Twilio para TTS con ElevenLabs`);
+
+                  // Guardamos cuántas palabras tenía este mensaje por si el [COLGAR] llega después
+                  if (session) {
+                    session.lastMessageWords = cleanText.split(/\s+/).length;
+                  }
+                }
+
+                // Si el bot mandó la orden de colgar, calculamos el tiempo y colgamos
+                if (isHangup) {
+                  console.log(`🔌 [${callSid}] Bot solicitó colgar la llamada. Programando fin...`);
+
+                  // Si el mensaje actual tiene texto, usamos sus palabras. Si está vacío (solo [COLGAR]), usamos las del mensaje anterior.
+                  let numeroDePalabras = cleanText ? cleanText.split(/\s+/).length : (session?.lastMessageWords || 1);
+
+                  // Cálculo de tiempo: 2.5 palabras por segundo + 2.5s de margen por transcripción/latencia
+                  const tiempoDeEsperaMs = (numeroDePalabras / 2.5) * 1000 + 3000;
+                  console.log(`⏳ Basado en ${numeroDePalabras} palabras. Esperando dinámicamente ${tiempoDeEsperaMs / 1000}s antes de cortar...`);
+
+                  setTimeout(async () => {
+                    try {
+                      const twilio = require('twilio');
+                      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+                      await client.calls(callSid).update({ status: 'completed' });
+                      console.log(`✅ [${callSid}] Llamada terminada exitosamente vía API.`);
+                    } catch (err) {
+                      console.error(`❌ [${callSid}] Error al colgar la llamada:`, err.message);
+                    }
+                  }, tiempoDeEsperaMs);
+                }
               } else if (botText) {
                 console.log(`🤖 [${callSid}] Bot respondió pero WebSocket cerrado: "${botText}"`);
               }
