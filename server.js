@@ -190,6 +190,31 @@ async function initBotpressSession(callSid, ws) {
     });
 
     console.log(`✅ [${callSid}] Sesión de Botpress lista`);
+
+    // 5. Enviar palabra clave secreta al bot para indicar que el canal es voz.
+    //    El bot puede usar esto en un nodo de decisión para setear canal="voz".
+    //    Esta palabra nunca se reproduce en voz — se filtra en el SSE listener.
+    console.log(`🔑 [${callSid}] Enviando palabra clave de canal al bot: CANAL_VOZ`);
+    const secretRes = await fetch(`${BOTPRESS_API_URL}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-key': userKey
+      },
+      body: JSON.stringify({
+        conversationId,
+        payload: {
+          type: 'text',
+          text: 'CANAL_VOZ'
+        }
+      })
+    });
+    if (secretRes.ok) {
+      console.log(`🔑 [${callSid}] Palabra clave CANAL_VOZ enviada al bot`);
+    } else {
+      console.warn(`⚠️ [${callSid}] No se pudo enviar la palabra clave: ${secretRes.status}`);
+    }
+
     return true;
   } catch (error) {
     console.error(`❌ [${callSid}] Error al iniciar Botpress:`, error.message);
@@ -262,6 +287,14 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
             // Solo procesar mensajes del bot (usando isBot flag)
             if (msgData.isBot || msgData.userId !== userId) {
               const botText = msgData.payload?.text;
+
+              // --- FILTRO: palabras clave internas (nunca se reproducen en voz) ---
+              // Si el bot responde SOLO con "CANAL_VOZ" (eco de la palabra clave de canal),
+              // lo ignoramos silenciosamente. Nunca debe escucharse en la llamada.
+              if (botText && botText.trim() === 'CANAL_VOZ') {
+                console.log(`🔕 [${callSid}] Eco de CANAL_VOZ ignorado (no se reproduce)`);
+                continue;
+              }
 
               if (botText && ws.readyState === ws.OPEN) {
                 console.log(`🤖 [${callSid}] Bot responde: "${botText}"`);
