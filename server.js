@@ -1,17 +1,6 @@
 // ============================================================
 // SERVIDOR MIDDLEWARE: Twilio ConversationRelay + Botpress + ElevenLabs
 // ============================================================
-// Este servidor actúa como puente entre:
-// 1. Twilio (llamadas telefónicas + ConversationRelay)
-// 2. Botpress (lógica del bot vía Chat API)
-// 3. ElevenLabs (voz TTS, gestionada automáticamente por Twilio ConversationRelay)
-//
-// Flujo:
-// Curl → Twilio llama → Tu servidor devuelve TwiML con ConversationRelay
-// → Twilio abre WebSocket → Tu servidor recibe voz transcrita del usuario
-// → Tu servidor envía texto a Botpress → Botpress responde
-// → Tu servidor envía respuesta por WebSocket → Twilio la convierte a voz ElevenLabs
-// ============================================================
 
 require('dotenv').config();
 const express = require('express');
@@ -43,15 +32,6 @@ app.get('/', (req, res) => {
   });
 });
 
-/**
- * ENDPOINT: /incoming-call
- * 
- * Este endpoint es llamado por Twilio cuando se inicia una llamada.
- * Devuelve TwiML que configura ConversationRelay con:
- * - ElevenLabs como proveedor de TTS
- * - Tu Voice ID de ElevenLabs
- * - WebSocket URL para la comunicación bidireccional
- */
 app.post('/incoming-call', (req, res) => {
   console.log('📞 Nueva llamada recibida');
   console.log(`   From: ${req.body.From}`);
@@ -69,9 +49,8 @@ app.post('/incoming-call', (req, res) => {
     voice: ELEVENLABS_VOICE_ID,
     language: 'es-ES',
     transcriptionLanguage: 'es-ES',
-    welcomeGreeting: 'Hi, I’m the Sevilla Walking Tour assistant. How can I help you? Hola, soy el asistente de Sevilla Walking Tour. ¿En qué puedo ayudarte?',
+    welcomeGreeting: "'Hi, I'm the Sevilla Walking Tour assistant. How can I help you? Hola, soy el asistente de Sevilla Walking Tour. ¿En qué puedo ayudarte?'",
     interruptible: 'true',
-    // ElevenLabs text normalization mejora pronunciación de números, fechas, etc.
     elevenlabsTextNormalization: 'auto'
   });
 
@@ -82,11 +61,6 @@ app.post('/incoming-call', (req, res) => {
   res.send(twiml);
 });
 
-/**
- * ENDPOINT: /call-ended
- * 
- * Llamado por Twilio cuando termina la sesión de ConversationRelay.
- */
 app.post('/call-ended', (req, res) => {
   console.log('📴 Llamada terminada');
   const response = new VoiceResponse();
@@ -96,12 +70,6 @@ app.post('/call-ended', (req, res) => {
   res.send(response.toString());
 });
 
-/**
- * ENDPOINT: /make-call
- * 
- * Endpoint de conveniencia para iniciar una llamada desde el navegador o curl.
- * Sustituye al comando curl que usabas antes.
- */
 app.post('/make-call', async (req, res) => {
   try {
     const twilio = require('twilio');
@@ -128,17 +96,12 @@ app.post('/make-call', async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// Almacena sesiones activas: callSid → { userKey, userId, conversationId, sseAbort }
 const activeSessions = new Map();
 
-// URL base de la Chat API de Botpress
 const BOTPRESS_API_URL = `https://chat.botpress.cloud/${BOTPRESS_WEBHOOK_ID}`;
 
-/**
- * Inicializa una sesión de Botpress Chat para una llamada.
- * Usa llamadas HTTP directas (sin SDK) para máxima fiabilidad.
- */
-async function initBotpressSession(callSid, ws) {
+// ✅ Añadidos fromNumber y toNumber como parámetros
+async function initBotpressSession(callSid, ws, fromNumber, toNumber) {
   console.log(`🤖 [${callSid}] Iniciando sesión de Botpress...`);
 
   try {
@@ -176,25 +139,26 @@ async function initBotpressSession(callSid, ws) {
     const conversationId = convData.conversation?.id;
     console.log(`🤖 [${callSid}] Conversación creada: ${conversationId}`);
 
-    // 3. Iniciar SSE listener para respuestas del bot
+    // 3. Iniciar SSE listener
     const abortController = new AbortController();
     startSSEListener(callSid, conversationId, userKey, userId, ws, abortController);
 
-    // 4. Guardar sesión
+    // 4. ✅ Guardar sesión con el número de teléfono
     activeSessions.set(callSid, {
       userKey,
       userId,
       conversationId,
       sseAbort: abortController,
-      lastMessageWords: 0 // Track words for hangup calculation
+      lastMessageWords: 0,
+      from: fromNumber,  // ✅ Número de quien llama
+      to: toNumber       // ✅ Tu número Twilio
     });
 
     console.log(`✅ [${callSid}] Sesión de Botpress lista`);
 
-    // 5. Enviar palabra clave secreta al bot para indicar que el canal es voz.
-    //    El bot puede usar esto en un nodo de decisión para setear canal="voz".
-    //    Esta palabra nunca se reproduce en voz — se filtra en el SSE listener.
-    console.log(`🔑 [${callSid}] Enviando palabra clave de canal al bot: CANAL_VOZ`);
+    // 5. Enviar palabra clave de canal
+    // 5. Enviar palabra clave de canal y número de teléfono
+    console.log(`🔑 [${callSid}] Enviando contexto inicial al bot...`);
     const secretRes = await fetch(`${BOTPRESS_API_URL}/messages`, {
       method: 'POST',
       headers: {
@@ -205,7 +169,8 @@ async function initBotpressSession(callSid, ws) {
         conversationId,
         payload: {
           type: 'text',
-          text: 'CANAL_VOZ'
+          // Adjuntamos el número separado por dos puntos
+          text: `CANAL_VOZ: ${fromNumber}`
         }
       })
     });
@@ -219,7 +184,6 @@ async function initBotpressSession(callSid, ws) {
   } catch (error) {
     console.error(`❌ [${callSid}] Error al iniciar Botpress:`, error.message);
 
-    // Enviar mensaje de error al usuario por voz
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
         type: 'text',
@@ -231,10 +195,6 @@ async function initBotpressSession(callSid, ws) {
   }
 }
 
-/**
- * Escucha respuestas del bot via Server-Sent Events (SSE).
- * Cuando el bot responde, envía el texto a Twilio por WebSocket.
- */
 async function startSSEListener(callSid, conversationId, userKey, userId, ws, abortController) {
   try {
     console.log(`📡 [${callSid}] Iniciando SSE listener...`);
@@ -267,30 +227,21 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
 
       buffer += decoder.decode(value, { stream: true });
 
-      // Procesar líneas completas del SSE
       const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // mantener línea incompleta en buffer
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
-        // Ignorar líneas vacías, event: prefixes, y comentarios
         if (!line.startsWith('data: ')) continue;
 
         try {
           const eventData = JSON.parse(line.slice(6));
 
-          // La estructura del evento SSE de Botpress es:
-          // { type: "message_created", data: { userId, payload, isBot, ... } }
-          // Los datos del mensaje están dentro de eventData.data
           if (eventData.type === 'message_created' && eventData.data) {
             const msgData = eventData.data;
 
-            // Solo procesar mensajes del bot (usando isBot flag)
             if (msgData.isBot || msgData.userId !== userId) {
               const botText = msgData.payload?.text;
 
-              // --- FILTRO: palabras clave internas (nunca se reproducen en voz) ---
-              // Si el bot responde SOLO con "CANAL_VOZ" (eco de la palabra clave de canal),
-              // lo ignoramos silenciosamente. Nunca debe escucharse en la llamada.
               if (botText && botText.trim() === 'CANAL_VOZ') {
                 console.log(`🔕 [${callSid}] Eco de CANAL_VOZ ignorado (no se reproduce)`);
                 continue;
@@ -299,13 +250,11 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
               if (botText && ws.readyState === ws.OPEN) {
                 console.log(`🤖 [${callSid}] Bot responde: "${botText}"`);
 
-                // --- LÓGICA PARA COLGAR LA LLAMADA ---
                 const isHangup = botText.includes('[COLGAR]');
                 const cleanText = botText.replace(/\[COLGAR\]/g, '').trim();
 
                 const session = activeSessions.get(callSid);
 
-                // Enviar el texto limpio (sin la etiqueta) a Twilio/ElevenLabs
                 if (cleanText) {
                   ws.send(JSON.stringify({
                     type: 'text',
@@ -314,25 +263,25 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
                   }));
                   console.log(`📤 [${callSid}] Texto enviado a Twilio para TTS con ElevenLabs`);
 
-                  // Guardamos cuántas palabras tenía este mensaje por si el [COLGAR] llega después
                   if (session) {
                     session.lastMessageWords = cleanText.split(/\s+/).length;
                   }
                 }
 
-                // Si el bot mandó la orden de colgar, calculamos el tiempo y colgamos
                 if (isHangup) {
                   console.log(`🔌 [${callSid}] Bot solicitó colgar la llamada. Programando fin...`);
 
-                  // Si el mensaje actual tiene texto, usamos sus palabras. Si está vacío (solo [COLGAR]), usamos las del mensaje anterior.
                   let numeroDePalabras = cleanText ? cleanText.split(/\s+/).length : (session?.lastMessageWords || 1);
-
-                  // Cálculo de tiempo: 2.5 palabras por segundo + 2.5s de margen por transcripción/latencia
                   const tiempoDeEsperaMs = (numeroDePalabras / 2.5) * 1000 + 3000;
                   console.log(`⏳ Basado en ${numeroDePalabras} palabras. Esperando dinámicamente ${tiempoDeEsperaMs / 1000}s antes de cortar...`);
 
                   setTimeout(async () => {
                     try {
+                      const session = activeSessions.get(callSid);
+
+                      // ✅ LOG DEL NÚMERO AL COLGAR
+                      console.log(`📞 [${callSid}] Número de quien llamó: ${session?.from}`);
+
                       const twilio = require('twilio');
                       const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
                       await client.calls(callSid).update({ status: 'completed' });
@@ -348,7 +297,7 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
             }
           }
         } catch (parseErr) {
-          // Ignorar líneas que no son JSON válido (ping, comments, etc.)
+          // Ignorar líneas que no son JSON válido
         }
       }
     }
@@ -361,9 +310,6 @@ async function startSSEListener(callSid, conversationId, userKey, userId, ws, ab
   }
 }
 
-/**
- * Envía un mensaje del usuario al bot de Botpress via HTTP.
- */
 async function sendToBotpress(callSid, userText) {
   const session = activeSessions.get(callSid);
   if (!session) {
@@ -400,14 +346,10 @@ async function sendToBotpress(callSid, userText) {
   }
 }
 
-/**
- * Limpia una sesión cuando la llamada termina.
- */
 function cleanupSession(callSid) {
   const session = activeSessions.get(callSid);
   if (session) {
     console.log(`🧹 [${callSid}] Limpiando sesión...`);
-    // Abortar el SSE listener
     if (session.sseAbort) {
       session.sseAbort.abort();
     }
@@ -429,29 +371,31 @@ wss.on('connection', (ws, req) => {
       const message = JSON.parse(data.toString());
 
       switch (message.type) {
-        // --------------------------------------------------------
-        // SETUP: Twilio envía info de la llamada al conectar el WebSocket
-        // --------------------------------------------------------
         case 'setup':
           callSid = message.callSid;
+
+          // ✅ CAPTURAR EL NÚMERO AQUÍ
+          const fromNumber = message.from;
+          const toNumber = message.to;
+
           console.log(`\n${'='.repeat(60)}`);
           console.log(`📞 NUEVA SESIÓN DE VOZ`);
-          console.log(`   CallSid: ${callSid}`);
-          console.log(`   From: ${message.from}`);
-          console.log(`   To: ${message.to}`);
+          console.log(`   CallSid:   ${callSid}`);
+          console.log(`   From:      ${fromNumber}`);
+          console.log(`   To:        ${toNumber}`);
           console.log(`   Direction: ${message.direction}`);
           if (message.customParameters) {
             console.log(`   Custom Params:`, message.customParameters);
           }
           console.log(`${'='.repeat(60)}\n`);
 
-          // Iniciar sesión de Botpress
-          botpressReady = await initBotpressSession(callSid, ws);
+          // ✅ LOG DESTACADO DEL NÚMERO
+          console.log(`📱 NÚMERO DE QUIEN LLAMA: ${fromNumber}`);
+
+          // ✅ Pasar el número a initBotpressSession
+          botpressReady = await initBotpressSession(callSid, ws, fromNumber, toNumber);
           break;
 
-        // --------------------------------------------------------
-        // PROMPT: El usuario ha dicho algo (transcrito por Twilio STT)
-        // --------------------------------------------------------
         case 'prompt':
           const userText = message.voicePrompt;
           console.log(`🎤 [${callSid}] Usuario dice: "${userText}"`);
@@ -460,31 +404,23 @@ wss.on('connection', (ws, req) => {
             await sendToBotpress(callSid, userText);
           } else if (!botpressReady) {
             console.log(`⏳ [${callSid}] Botpress aún no está listo, reintentando...`);
-            botpressReady = await initBotpressSession(callSid, ws);
+            const session = activeSessions.get(callSid);
+            botpressReady = await initBotpressSession(callSid, ws, session?.from, session?.to);
             if (botpressReady) {
               await sendToBotpress(callSid, userText);
             }
           }
           break;
 
-        // --------------------------------------------------------
-        // INTERRUPT: El usuario interrumpió al bot mientras hablaba
-        // --------------------------------------------------------
         case 'interrupt':
           console.log(`✋ [${callSid}] Usuario interrumpió al bot`);
           console.log(`   Lo dicho hasta la interrupción: "${message.utteranceUntilInterrupt}"`);
           break;
 
-        // --------------------------------------------------------
-        // DTMF: El usuario presionó una tecla
-        // --------------------------------------------------------
         case 'dtmf':
           console.log(`🔢 [${callSid}] DTMF: ${message.digit}`);
           break;
 
-        // --------------------------------------------------------
-        // ERROR: Error en ConversationRelay
-        // --------------------------------------------------------
         case 'error':
           console.error(`❌ [${callSid}] Error de ConversationRelay: ${message.description}`);
           break;
